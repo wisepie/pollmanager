@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::dinkdonk;
 use copypasta::{ClipboardContext, ClipboardProvider};
 use eframe::egui;
+use std::io::ErrorKind;
 use tokio::runtime::Runtime;
 
 struct App {
@@ -13,19 +14,42 @@ struct App {
     broadcast: bool,
     rating_link: String,
     rt: Runtime,
-    clip_ctx: ClipboardContext,
+    clip_ctx: Option<ClipboardContext>,
     status: String,
 }
 impl Default for App {
     fn default() -> Self {
         let mut config = Config::default();
-        let _ = config.get_or_build_path();
+        let mut status = String::new();
 
-        let has_key = match config.read_file() {
-            Ok(_) => !config.apikey.is_empty(),
-            Err(_) => false,
+        if let Err(e) = config.get_or_build_path() {
+            status = format!("Error creating config directory: {e}");
+        }
+
+        let has_key = if status.is_empty() {
+            match config.read_file() {
+                Ok(_) => !config.apikey.is_empty(),
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        status = format!("Error reading config: {e}");
+                    }
+                    false
+                }
+            }
+        } else {
+            false
         };
-        let rt = Runtime::new().expect("Error ");
+
+        let clip_ctx = match ClipboardContext::new() {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                if status.is_empty() {
+                    status = format!("Clipboard unavailable: {e}");
+                }
+                None
+            }
+        };
+        let rt = Runtime::new().expect("Failed to create Tokio runtime");
         Self {
             config,
             has_key,
@@ -35,8 +59,8 @@ impl Default for App {
             broadcast: false,
             rating_link: String::new(),
             rt,
-            clip_ctx: ClipboardContext::new().unwrap(),
-            status: String::new(),
+            clip_ctx,
+            status,
         }
     }
 }
@@ -60,17 +84,35 @@ impl eframe::App for App {
                             self.randomize,
                             self.broadcast,
                         )) {
-                            Ok(link) => self.rating_link = link,
-                            Err(_) => println!("Error"),
+                            Ok(link) => {
+                                self.rating_link = link;
+                                self.status.clear();
+                            }
+                            Err(e) => {
+                                self.status = format!("Failed to post poll: {e}");
+                            }
                         }
                     }
                     ui.label(format!("Poll Link: {}", self.rating_link));
                     if ui.button("Copy").clicked() {
-                        self.clip_ctx
-                            .set_contents(self.rating_link.clone())
-                            .expect("Error Copying to Clipboard");
+                        match self.clip_ctx.as_mut() {
+                            Some(ctx) => {
+                                if let Err(e) = ctx.set_contents(self.rating_link.clone()) {
+                                    self.status =
+                                        format!("Clipboard unavailable right now: {e}");
+                                } else {
+                                    self.status.clear();
+                                }
+                            }
+                            None => {
+                                self.status = String::from(
+                                    "Clipboard access failed; restart or close other clipboard tools",
+                                );
+                            }
+                        }
                     }
                 });
+                ui.label(&self.status);
                 return;
             }
 
@@ -82,14 +124,24 @@ impl eframe::App for App {
             );
 
             if ui.button("Save Key").clicked() {
-                match self.config.check_key(self.key_input.clone()) {
-                    Ok(_) => {
-                        if let Ok(_) = self.config.save_file() {
-                            self.has_key = true;
+                if self.config.path.is_none() {
+                    self.status = String::from(
+                        "Config directory unavailable; restart the app after fixing permissions",
+                    );
+                } else {
+                    match self.config.check_key(self.key_input.clone()) {
+                        Ok(_) => match self.config.save_file() {
+                            Ok(_) => {
+                                self.has_key = true;
+                                self.status.clear();
+                            }
+                            Err(e) => {
+                                self.status = format!("Failed to save config: {e}");
+                            }
+                        },
+                        Err(e) => {
+                            self.status = format!("Error: {}", e);
                         }
-                    }
-                    Err(e) => {
-                        self.status = format!("Error: {}", e);
                     }
                 }
             }
